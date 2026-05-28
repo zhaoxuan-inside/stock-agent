@@ -3,22 +3,22 @@
 
 """
 股票历史日线数据采集脚本（BaoStock -> PostgreSQL）
+优化版：单进程串行 + 全局登录一次 + signal超时控制
 - 分页读取股票代码
-- 多进程 + 强制超时（单只股票绝对超时）
-- 独立登录，避免全局阻塞
+- 全程只登录一次，避免频繁登录
+- 单只股票独立超时（signal.alarm）
 - 自动重试，跳过失败股票
 - Upsert（插入或更新）策略
 - 断点续传：记录进度，中断后可从断点继续
 """
 
+import argparse
 import sys
 import logging
 import time
 import os
+import signal
 from datetime import datetime
-from typing import List, Set, Optional
-import multiprocessing as mp
-from functools import partial
 
 import psycopg2
 from psycopg2.extras import execute_values
@@ -28,17 +28,15 @@ import baostock as bs
 DB_CONFIG = {
     "host": "192.168.2.112",
     "port": 5432,
-    "database": "stock",      # 请修改
-    "user": "stock",          # 请修改
-    "password": "iPasswd1234"  # 请修改
+    "database": "stock",          # 请修改
+    "user": "stock",              # 请修改
+    "password": "iPasswd1234"     # 请修改
 }
 
-START_DATE = datetime.now().strftime("%Y-%m-%d")
-END_DATE = datetime.now().strftime("%Y-%m-%d")
-BATCH_SIZE = 50                  # 每批处理的股票数量
-PROCESS_TIMEOUT = 90             # 单只股票处理超时（秒）
-MAX_RETRIES = 2                  # 每只股票最大重试次数
-RETRY_DELAY = 5                  # 重试间隔（秒）
+BATCH_SIZE = 50                  # 每批获取的股票数量（仅用于分页读取代码）
+SINGLE_STOCK_TIMEOUT = 600       # 单只股票处理超时（秒）
+MAX_RETRIES = 5                  # 每只股票最大重试次数
+RETRY_DELAY = 60                  # 重试间隔（秒）
 UPSERT_PAGE_SIZE = 1000          # 单只股票内部批量插入大小
 
 PROGRESS_FILE = "stock_fetch_progress.txt"  # 记录进度的文件
@@ -77,6 +75,7 @@ DB_COLUMNS = [
 
 
 def get_db_connection():
+    """创建 PostgreSQL 连接"""
     return psycopg2.connect(**DB_CONFIG)
 
 
@@ -96,10 +95,7 @@ def get_stock_codes_paginated(conn, offset: int, limit: int) -> List[str]:
 
 
 def load_progress() -> int:
-    """
-    从本地文件读取上次处理到的偏移量（已完成股票数量）。
-    如果文件不存在，返回 0。
-    """
+    """从本地文件读取上次处理到的偏移量（已完成股票数量）"""
     if not os.path.exists(PROGRESS_FILE):
         return 0
     try:
@@ -123,6 +119,7 @@ def save_progress(offset: int):
 
 
 def convert_row_to_db_types(row: dict, stock_code: str) -> dict:
+    """将 baostock 原始数据行转换为数据库字段格式"""
     converted = {}
     for key, value in row.items():
         db_key = FIELD_MAPPING.get(key, key)
@@ -144,14 +141,9 @@ def convert_row_to_db_types(row: dict, stock_code: str) -> dict:
 
 def process_one_stock(stock_code: str, start_date: str, end_date: str) -> tuple:
     """
-    处理单只股票：获取数据并写入数据库。
+    处理单只股票的核心逻辑（baostock 已全局登录，无需重复登录）
     返回值 (stock_code, success, record_count, error_msg)
     """
-    # 每个进程独立登录
-    login_result = bs.login()
-    if login_result.error_code != '0':
-        return (stock_code, False, 0, f"登录失败: {login_result.error_msg}")
-
     try:
         rs = bs.query_history_k_data_plus(
             code=stock_code,
@@ -162,7 +154,12 @@ def process_one_stock(stock_code: str, start_date: str, end_date: str) -> tuple:
             adjustflag="3"
         )
         if rs.error_code != '0':
-            return (stock_code, False, 0, f"查询失败: {rs.error_msg}")
+            if rs.error_code == '10001001':
+                bs.logout()  # 可能是登录状态异常，先登出
+                time.sleep(5)  # 等待一会儿再继续
+                bs.login()   # 重新登录
+                return process_one_stock(stock_code, start_date, end_date)  # 重试一次
+            return (stock_code, False, 0, f"查询失败: code: {rs.error_code} msg: {rs.error_msg}")
 
         records = []
         while rs.next():
@@ -171,7 +168,7 @@ def process_one_stock(stock_code: str, start_date: str, end_date: str) -> tuple:
             records.append(db_row)
 
         if not records:
-            return (stock_code, True, 0, "无数据")
+            return (stock_code, True, 0, None)
 
         # 写入数据库
         conn = get_db_connection()
@@ -193,33 +190,55 @@ def process_one_stock(stock_code: str, start_date: str, end_date: str) -> tuple:
             conn.close()
     except Exception as e:
         return (stock_code, False, 0, str(e))
+
+
+def handle_stock_with_timeout(stock_code: str, start_date: str, end_date: str, timeout: int) -> tuple:
+    """
+    为单只股票设置超时控制（使用 signal.alarm）
+    返回 (stock_code, success, record_count, error_msg)
+    """
+    def _timeout_handler(signum, frame):
+        raise TimeoutError(f"股票处理超时（>{timeout}秒）")
+
+    # 保存原有信号处理器，处理完后恢复
+    original_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(timeout)
+
+    try:
+        result = process_one_stock(stock_code, start_date, end_date)
+        signal.alarm(0)  # 取消闹钟
+        return result
+    except TimeoutError as e:
+        signal.alarm(0)
+        return (stock_code, False, 0, str(e))
     finally:
-        bs.logout()
-
-
-def run_with_timeout(stock_code: str, start_date: str, end_date: str, timeout: int) -> tuple:
-    """
-    在独立进程中运行 process_one_stock，并设置超时。
-    """
-    ctx = mp.get_context('fork')
-    q = ctx.Queue()
-    p = ctx.Process(target=lambda q, args: q.put(process_one_stock(*args)), args=(q, (stock_code, start_date, end_date)))
-    p.start()
-    p.join(timeout)
-
-    if p.is_alive():
-        p.terminate()
-        p.join()
-        return (stock_code, False, 0, f"超时（>{timeout}秒）")
-    else:
-        return q.get()
+        signal.signal(signal.SIGALRM, original_handler)
 
 
 def main():
-    start_time = datetime.now()
-    logger.info("===== 开始采集股票日线数据（断点续传模式） =====")
 
-    # 1. 连接数据库获取信息
+    parser = argparse.ArgumentParser(description='脚本说明：根据状态日期执行任务')
+    parser.add_argument('--date', type=str, required=True, help='状态日期，格式 YYYY-MM-DD，用于指导脚本执行')
+    args = parser.parse_args()
+    date = args.date
+
+    start_time = datetime.now()
+
+    START_DATE = start_time.strftime("%Y-%m-%d")
+    END_DATE = START_DATE
+    if not date:
+        START_DATE = date
+    
+    logger.info("[%s] 采集 %s 日k数据", start_time, START_DATE)
+
+    # 1. 全局登录 baostock（只登录一次）
+    login_result = bs.login()
+    if login_result.error_code != '0':
+        logger.error("baostock 登录失败: %s，程序退出", login_result.error_msg)
+        sys.exit(1)
+    logger.info("baostock 全局登录成功")
+
+    # 2. 连接数据库获取股票列表信息
     conn = get_db_connection()
     try:
         total_stocks = get_total_stock_count(conn)
@@ -227,10 +246,11 @@ def main():
     finally:
         conn.close()
 
-    # 2. 读取上次进度
+    # 3. 读取上次进度
     start_offset = load_progress()
     if start_offset >= total_stocks:
         logger.info("所有股票已处理完成，无需继续。")
+        bs.logout()
         return
 
     logger.info("从偏移量 %d 开始继续处理（已跳过 %d 只股票）", start_offset, start_offset)
@@ -239,10 +259,9 @@ def main():
     success_count = 0
     fail_count = 0
     total_records = 0
-    processed_count = 0  # 当前会话已处理股票数（用于日志）
 
+    # 4. 循环分批获取股票代码并处理
     while offset < total_stocks:
-        # 分批获取股票代码
         conn = get_db_connection()
         try:
             batch_codes = get_stock_codes_paginated(conn, offset, BATCH_SIZE)
@@ -254,46 +273,57 @@ def main():
 
         logger.info("处理第 %d - %d 批股票，共 %d 只", offset+1, offset+len(batch_codes), len(batch_codes))
 
-        # 处理当前批次的每只股票
+        # 串行处理当前批次的每只股票
         for code in batch_codes:
             # 重试机制
+            final_success = False
+            final_records = 0
+            final_error = None
+
             for attempt in range(1, MAX_RETRIES + 1):
                 logger.info("处理股票 %s (尝试 %d/%d)", code, attempt, MAX_RETRIES)
-                result = run_with_timeout(code, START_DATE, END_DATE, PROCESS_TIMEOUT)
+                result = handle_stock_with_timeout(code, START_DATE, END_DATE, SINGLE_STOCK_TIMEOUT)
                 stock, ok, rec_count, err_msg = result
+
                 if ok:
-                    success_count += 1
-                    processed_count += 1
-                    total_records += rec_count
-                    logger.info("股票 %s 成功，获取 %d 条记录", stock, rec_count)
+                    final_success = True
+                    final_records = rec_count
+                    final_error = None
                     break
                 else:
+                    final_error = err_msg
                     logger.error("股票 %s 失败 (尝试 %d/%d): %s", stock, attempt, MAX_RETRIES, err_msg)
                     if attempt < MAX_RETRIES:
                         time.sleep(RETRY_DELAY)
-                    else:
-                        fail_count += 1
-                        processed_count += 1
-                        logger.error("股票 %s 最终失败，跳过", stock)
 
-        # 更新偏移量：当前批次处理完后，offset 增加 batch 大小
+            if final_success:
+                success_count += 1
+                total_records += final_records
+                logger.info("股票 %s 成功，获取 %d 条记录", code, final_records)
+            else:
+                fail_count += 1
+                logger.error("股票 %s 最终失败，跳过: %s", code, final_error)
+
+        # 更新偏移量（当前批次处理完）
         offset += len(batch_codes)
-        # 保存进度（每批完成后保存一次）
         save_progress(offset)
         logger.info("当前进度: 成功 %d, 失败 %d, 总计记录 %d, 已处理 %d/%d 只股票",
                     success_count, fail_count, total_records, offset, total_stocks)
 
-    # 最终完成，删除进度文件（可选）
+    # 5. 全部处理完成，注销 baostock
+    bs.logout()
+    logger.info("baostock 已注销")
+
+    # 删除进度文件
     if offset >= total_stocks:
         logger.info("所有股票处理完毕，删除进度文件")
         if os.path.exists(PROGRESS_FILE):
             os.remove(PROGRESS_FILE)
 
-    elapsed = datetime.now() - start_time
+    gap = datetime.now() - start_time
     logger.info("===== 采集完成 =====")
-    logger.info("成功: %d, 失败: %d, 总记录数: %d, 耗时: %s", success_count, fail_count, total_records, elapsed)
+    logger.info("成功: %d, 失败: %d, 总记录数: %d, 耗时: %s", success_count, fail_count, total_records, gap)
 
 
 if __name__ == "__main__":
-    mp.set_start_method('fork', force=True)
     main()
