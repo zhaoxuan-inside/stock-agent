@@ -12,13 +12,14 @@
 - 断点续传：记录进度，中断后可从断点继续
 """
 
+import argparse
 import sys
 import logging
 import time
 import os
 import signal
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 
 import psycopg2
 from psycopg2.extras import execute_values
@@ -209,8 +210,20 @@ def handle_stock_with_timeout(stock_code: str, start_date: str, end_date: str, t
 
 
 def main():
+
+    parser = argparse.ArgumentParser(description='脚本说明：根据状态日期执行任务')
+    parser.add_argument('--date', type=str, required=True, help='状态日期，格式 YYYY-MM-DD，用于指导脚本执行')
+    args = parser.parse_args()
+    date = args.date
+
     start_time = datetime.now()
-    logger.info("===== 开始采集股票5min数据（优化版：全局登录一次 + 串行 + 超时控制） =====")
+
+    START_DATE = start_time.strftime("%Y-%m-%d")
+    END_DATE = START_DATE
+    if not date:
+        START_DATE = date
+    
+    logger.info("[%s] 采集 %s 5分钟k线数据", start_time, START_DATE)
 
     # 1. 全局登录 baostock（只登录一次）
     login_result = bs.login()
