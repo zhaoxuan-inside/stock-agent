@@ -19,6 +19,7 @@ import time
 import os
 import signal
 from datetime import datetime
+from typing import List
 
 import psycopg2
 from psycopg2.extras import execute_values
@@ -218,7 +219,7 @@ def handle_stock_with_timeout(stock_code: str, start_date: str, end_date: str, t
 def main():
 
     parser = argparse.ArgumentParser(description='脚本说明：根据状态日期执行任务')
-    parser.add_argument('--date', type=str, required=True, help='状态日期，格式 YYYY-MM-DD，用于指导脚本执行')
+    parser.add_argument('--date', type=str, required=False, help='状态日期，格式 YYYY-MM-DD，用于指导脚本执行')
     args = parser.parse_args()
     date = args.date
 
@@ -226,7 +227,7 @@ def main():
 
     START_DATE = start_time.strftime("%Y-%m-%d")
     END_DATE = START_DATE
-    if not date:
+    if date:
         START_DATE = date
     
     logger.info("[%s] 采集 %s 日k数据", start_time, START_DATE)
