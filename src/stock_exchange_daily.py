@@ -225,7 +225,8 @@ def main():
     start_date = args.start_date
     end_date = args.end_date
 
-    START_DATE = datetime.now().strftime("%Y-%m-%d")
+    start_time = datetime.now()
+    START_DATE = start_time.strftime("%Y-%m-%d")
     END_DATE = START_DATE
     if start_date:
         START_DATE = start_date
