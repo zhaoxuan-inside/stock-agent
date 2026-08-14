@@ -219,18 +219,20 @@ def handle_stock_with_timeout(stock_code: str, start_date: str, end_date: str, t
 def main():
 
     parser = argparse.ArgumentParser(description='脚本说明：根据状态日期执行任务')
-    parser.add_argument('--date', type=str, required=False, help='状态日期，格式 YYYY-MM-DD，用于指导脚本执行')
+    parser.add_argument('--start_date', type=str, required=False, help='状态日期，格式 YYYY-MM-DD，用于指导脚本执行')
+    parser.add_argument('--end_date', type=str, required=False, help='结束日期，格式 YYYY-MM-DD，用于指导脚本执行')
     args = parser.parse_args()
-    date = args.date
+    start_date = args.start_date
+    end_date = args.end_date
 
-    start_time = datetime.now()
-
-    START_DATE = start_time.strftime("%Y-%m-%d")
+    START_DATE = datetime.now().strftime("%Y-%m-%d")
     END_DATE = START_DATE
-    if date:
-        START_DATE = date
-    
-    logger.info("[%s] 采集 %s 日k数据", start_time, START_DATE)
+    if start_date:
+        START_DATE = start_date
+    if end_date:
+        END_DATE = end_date
+
+    logger.info("采集 %s 至 %s 的k数据", START_DATE, END_DATE)
 
     # 1. 全局登录 baostock（只登录一次）
     login_result = bs.login()
